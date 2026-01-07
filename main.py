@@ -1,13 +1,11 @@
-import time
 import sqlite3
-import httpx
 import os
+import random
 from fastapi import FastAPI, Query
-from typing import List
+from typing import List, Dict
 from pydantic import BaseModel
 
 # --- CONFIGURAÇÕES ---
-URL_FONTE_GPS = "https://dados.mobilidade.rio/gps/sppo"
 DB_NAME = "gtfs.db"
 
 app = FastAPI()
@@ -20,91 +18,87 @@ class OnibusResponse(BaseModel):
     velocidade: float
     status: str
 
+# Estado global para a simulação: { "linha": [ { "ordem": "...", "index_no_shape": 0 } ] }
+simulacao_onibus: Dict[str, List[dict]] = {}
+# Cache de shapes para não ler o banco toda hora: { "linha": [ (lat, lon), ... ] }
+cache_shapes: Dict[str, List[tuple]] = {}
+
+def get_db_connection():
+    if not os.path.exists(DB_NAME): return None
+    return sqlite3.connect(DB_NAME)
+
+def carregar_shape(linha: str):
+    """Busca o primeiro shape disponível para a linha no banco."""
+    if linha in cache_shapes: return cache_shapes[linha]
+    
+    conn = get_db_connection()
+    if not conn: return []
+    try:
+        cursor = conn.execute("""
+            SELECT s.shape_pt_lat, s.shape_pt_lon 
+            FROM route_shapes s
+            JOIN routes r ON s.route_id = r.route_id
+            WHERE r.route_short_name = ?
+            ORDER BY s.shape_id, s.shape_pt_sequence
+            LIMIT 200
+        """, (linha,))
+        pontos = cursor.fetchall()
+        if pontos:
+            cache_shapes[linha] = pontos
+            return pontos
+    except: pass
+    finally: conn.close()
+    return []
+
 @app.get("/")
 async def root():
-    return {"status": "online"}
+    return {"status": "simulacao_ativa", "linhas_simuladas": list(simulacao_onibus.keys())}
 
 @app.get("/onibus", response_model=List[OnibusResponse])
-async def get_realtime_buses(linhas: str = Query(...)):
-    # Normaliza as linhas para evitar problemas de comparação (ex: "0416" vs "416")
-    linhas_alvo = set(l.strip().lstrip('0') for l in linhas.split(","))
+async def get_simulated_buses(linhas: str = Query(...)):
+    linhas_alvo = [l.strip() for l in linhas.split(",")]
     resultado = []
     
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            agora_ms = int(time.time() * 1000)
-            # Aumentamos a janela para 2 minutos (120.000ms) para garantir que pegamos dados
-            # A API do Rio às vezes demora a atualizar o sinal de alguns ônibus
-            params = { "dataInicial": agora_ms - 120000, "dataFinal": agora_ms }
-            
-            print(f"DEBUG: Consultando linhas {linhas_alvo} na janela de 2min")
-            response = await client.get(URL_FONTE_GPS, params=params)
-            
-            if response.status_code == 200:
-                dados = response.json()
-                veiculos = dados if isinstance(dados, list) else dados.get('veiculos', [])
-                
-                print(f"DEBUG: Recebidos {len(veiculos)} veículos da prefeitura")
-                
-                # Dicionário para manter apenas a posição mais recente de cada ônibus (pela ordem)
-                mais_recentes = {}
-
-                for bus in veiculos:
-                    try:
-                        # Limpeza da linha: remove ".0" e zeros à esquerda para bater com o banco
-                        linha_raw = str(bus.get('linha', '')).split('.')[0].lstrip('0')
-                        
-                        if linha_raw in linhas_alvo:
-                            ordem = bus.get('ordem')
-                            # Se já vimos esse ônibus nesta resposta, mantemos apenas o mais recente
-                            # (A API pode retornar múltiplas posições se a janela for grande)
-                            mais_recentes[ordem] = {
-                                "ordem": ordem,
-                                "linha": linha_raw,
-                                "latitude": float(bus['latitude'].replace(',', '.')),
-                                "longitude": float(bus['longitude'].replace(',', '.')),
-                                "velocidade": float(bus.get('velocidade', 0)),
-                                "status": "Em movimento" if float(bus.get('velocidade', 0)) > 1 else "Parado"
-                            }
-                    except: continue
-                
-                resultado = list(mais_recentes.values())
-                print(f"DEBUG: Filtrados {len(resultado)} ônibus para as linhas solicitadas")
-                
-    except Exception as e:
-        print(f"ERRO: {e}")
+    for linha in linhas_alvo:
+        shape = carregar_shape(linha)
+        if not shape: continue
         
+        # Se a linha ainda não tem ônibus simulados, cria 3 ônibus em pontos aleatórios
+        if linha not in simulacao_onibus:
+            simulacao_onibus[linha] = [
+                {"ordem": f"SIM-{linha}-{i}", "idx": random.randint(0, len(shape)-1)}
+                for i in range(3)
+            ]
+        
+        # Atualiza a posição de cada ônibus (move para o próximo ponto do shape)
+        for bus in simulacao_onibus[linha]:
+            bus["idx"] = (bus["idx"] + 1) % len(shape)
+            ponto = shape[bus["idx"]]
+            
+            resultado.append({
+                "ordem": bus["ordem"],
+                "linha": linha,
+                "latitude": ponto[0],
+                "longitude": ponto[1],
+                "velocidade": 40.0,
+                "status": "Simulado"
+            })
+            
     return resultado
 
 @app.get("/linhas")
 async def get_todas_linhas():
-    if not os.path.exists(DB_NAME): return []
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn: return []
     try:
-        cursor = conn.execute("SELECT DISTINCT route_short_name, route_long_name FROM routes")
+        cursor = conn.execute("SELECT DISTINCT route_short_name, route_long_name FROM routes LIMIT 100")
         return [{"numero": r[0], "nome": r[1]} for r in cursor.fetchall()]
     except: return []
     finally: conn.close()
 
 @app.get("/linhas/{linha_numero}/shape")
 async def get_shape_linha(linha_numero: str):
-    if not os.path.exists(DB_NAME): return []
-    conn = sqlite3.connect(DB_NAME)
-    try:
-        # Normaliza a linha para a busca no banco
-        linha_busca = linha_numero.lstrip('0')
-        cursor = conn.execute("""
-            SELECT s.shape_id, s.shape_pt_lat, s.shape_pt_lon 
-            FROM route_shapes s
-            JOIN routes r ON s.route_id = r.route_id
-            WHERE r.route_short_name = ? OR r.route_short_name = ?
-        """, (linha_busca, linha_numero))
-        
-        shapes = {}
-        for row in cursor:
-            sid = row[0]
-            if sid not in shapes: shapes[sid] = []
-            shapes[sid].append({"latitude": row[1], "longitude": row[2]})
-        return list(shapes.values())
-    except: return []
-    finally: conn.close()
+    shape = carregar_shape(linha_numero)
+    if not shape: return []
+    # Retorna no formato esperado pelo app: List[List[Ponto]]
+    return [[{"latitude": p[0], "longitude": p[1]} for p in shape]]
