@@ -1,8 +1,9 @@
 import time
 import sqlite3
 import httpx
+import os
 from fastapi import FastAPI, Query
-from typing import List, Optional
+from typing import List
 from pydantic import BaseModel
 
 # --- CONFIGURAÇÕES ---
@@ -26,42 +27,41 @@ class LinhaInfo(BaseModel):
 
 # --- HELPER DE BANCO DE DADOS ---
 def get_db_connection():
+    # Verifica se o arquivo existe para evitar erros de travamento
+    if not os.path.exists(DB_NAME):
+        return None
     conn = sqlite3.connect(DB_NAME)
-    # Otimização extrema para SQLite
     conn.execute("PRAGMA journal_mode = OFF")
-    conn.execute("PRAGMA cache_size = 500") # Apenas 0.5MB de cache
+    conn.execute("PRAGMA cache_size = 500")
     return conn
 
 @app.get("/")
 async def root():
-    return {"status": "online", "mode": "on-demand"}
+    # Endpoint de health check ultra-rápido para o Render
+    return {"status": "online", "db_exists": os.path.exists(DB_NAME)}
 
 @app.get("/linhas")
 async def get_todas_linhas():
     conn = get_db_connection()
+    if not conn: return []
     try:
-        cursor = conn.execute("SELECT route_short_name, route_long_name FROM routes")
+        cursor = conn.execute("SELECT route_short_name, route_long_name FROM routes LIMIT 500")
         return [{"numero": r[0], "nome": r[1]} for r in cursor.fetchall()]
     except: return []
     finally: conn.close()
 
 @app.get("/onibus", response_model=List[OnibusResponse])
 async def get_realtime_buses(linhas: str = Query(...)):
-    """
-    Busca os dados na prefeitura apenas quando o app pede.
-    Isso evita manter um cache gigante na memória.
-    """
     linhas_alvo = set(linhas.split(","))
     resultado = []
     
     try:
-        async with httpx.AsyncClient() as client:
+        # Usamos um timeout menor para não travar o worker do Render
+        async with httpx.AsyncClient(timeout=5.0) as client:
             agora_ms = int(time.time() * 1000)
-            # Janela de 40s para garantir que pegamos dados
-            params = { "dataInicial": agora_ms - 40000, "dataFinal": agora_ms }
+            params = { "dataInicial": agora_ms - 45000, "dataFinal": agora_ms }
             
-            # Fazemos a requisição e processamos IMEDIATAMENTE
-            response = await client.get(URL_FONTE_GPS, params=params, timeout=10.0)
+            response = await client.get(URL_FONTE_GPS, params=params)
             
             if response.status_code == 200:
                 dados = response.json()
@@ -70,26 +70,25 @@ async def get_realtime_buses(linhas: str = Query(...)):
                 for bus in veiculos:
                     linha = str(bus.get('linha', '')).replace('.0', '')
                     if linha in linhas_alvo:
-                        resultado.append({
-                            "ordem": bus.get('ordem', 'S/N'),
-                            "linha": linha,
-                            "latitude": float(bus['latitude'].replace(',', '.')),
-                            "longitude": float(bus['longitude'].replace(',', '.')),
-                            "velocidade": float(bus.get('velocidade', 0)),
-                            "status": "Em movimento" if float(bus.get('velocidade', 0)) > 1 else "Parado"
-                        })
-                
-                # Limpeza explícita para ajudar o Garbage Collector
-                del veiculos
-                del dados
-    except Exception as e:
-        print(f"Erro na consulta: {e}")
+                        try:
+                            resultado.append({
+                                "ordem": bus.get('ordem', 'S/N'),
+                                "linha": linha,
+                                "latitude": float(bus['latitude'].replace(',', '.')),
+                                "longitude": float(bus['longitude'].replace(',', '.')),
+                                "velocidade": float(bus.get('velocidade', 0)),
+                                "status": "Em movimento" if float(bus.get('velocidade', 0)) > 1 else "Parado"
+                            })
+                        except: continue
+    except Exception:
+        pass
         
     return resultado
 
 @app.get("/linhas/{linha_numero}/shape")
 async def get_shape_linha(linha_numero: str):
     conn = get_db_connection()
+    if not conn: return []
     try:
         cursor = conn.execute("""
             SELECT s.shape_id, s.shape_pt_lat, s.shape_pt_lon 
