@@ -1,22 +1,15 @@
-import asyncio
 import time
 import sqlite3
 import httpx
-import json
 from fastapi import FastAPI, Query
-from typing import List, Dict, Optional
+from typing import List, Optional
 from pydantic import BaseModel
-from contextlib import asynccontextmanager
 
 # --- CONFIGURAÇÕES ---
 URL_FONTE_GPS = "https://dados.mobilidade.rio/gps/sppo"
 DB_NAME = "gtfs.db"
-INTERVALO_BUSCA = 20  # Aumentado para 20s para dar fôlego ao CPU/RAM
-TEMPO_EXPIRACAO = 120 # Apenas 2 minutos de cache
 
-# Cache global usando dicionário de tuplas (muito leve)
-# Estrutura: { "ordem": (linha, lat, lon, vel, timestamp) }
-global_buses = {}
+app = FastAPI()
 
 # --- MODELOS ---
 class OnibusResponse(BaseModel):
@@ -27,82 +20,26 @@ class OnibusResponse(BaseModel):
     velocidade: float
     status: str
 
-# --- WORKER OTIMIZADO ---
-async def fetch_rio_data():
-    """Busca dados e processa de forma a evitar picos de memória."""
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                agora = time.time()
-                agora_ms = int(agora * 1000)
-                # Janela menor (20s) para vir menos dados por vez
-                params = { "dataInicial": agora_ms - 20000, "dataFinal": agora_ms }
-                
-                # Usamos timeout curto para não acumular requisições
-                response = await client.get(URL_FONTE_GPS, params=params, timeout=10.0)
-                
-                if response.status_code == 200:
-                    # Em vez de carregar tudo com .json(), processamos com cuidado
-                    dados = response.json()
-                    veiculos = dados if isinstance(dados, list) else dados.get('veiculos', [])
-                    
-                    # Limpeza preventiva do cache
-                    if len(global_buses) > 1500:
-                        chaves = list(global_buses.keys())
-                        for k in chaves:
-                            if agora - global_buses[k][4] > TEMPO_EXPIRACAO:
-                                del global_buses[k]
+class LinhaInfo(BaseModel):
+    numero: str
+    nome: str
 
-                    for bus in veiculos:
-                        try:
-                            ordem = bus.get('ordem')
-                            linha = str(bus.get('linha', '')).replace('.0', '')
-                            if not ordem or not linha: continue
-                            
-                            # Armazenar apenas o estritamente necessário
-                            global_buses[ordem] = (
-                                linha,
-                                float(bus['latitude'].replace(',', '.')),
-                                float(bus['longitude'].replace(',', '.')),
-                                float(bus.get('velocidade', 0)),
-                                agora
-                            )
-                        except: continue
-                    
-                    # Forçar coleta de lixo do Python se necessário (opcional)
-                    del veiculos
-                    del dados
-                    
-            except Exception:
-                pass # Silencioso para economizar logs/CPU
-            
-            await asyncio.sleep(INTERVALO_BUSCA)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(fetch_rio_data())
-    yield
-    task.cancel()
-
-app = FastAPI(lifespan=lifespan)
-
+# --- HELPER DE BANCO DE DADOS ---
 def get_db_connection():
-    # Otimização máxima para SQLite em ambiente de pouca RAM
     conn = sqlite3.connect(DB_NAME)
+    # Otimização extrema para SQLite
     conn.execute("PRAGMA journal_mode = OFF")
-    conn.execute("PRAGMA synchronous = OFF")
-    conn.execute("PRAGMA cache_size = 1000") # Limita cache do SQLite a ~1MB
+    conn.execute("PRAGMA cache_size = 500") # Apenas 0.5MB de cache
     return conn
 
 @app.get("/")
 async def root():
-    return {"active": len(global_buses)}
+    return {"status": "online", "mode": "on-demand"}
 
 @app.get("/linhas")
 async def get_todas_linhas():
     conn = get_db_connection()
     try:
-        # Busca apenas o necessário
         cursor = conn.execute("SELECT route_short_name, route_long_name FROM routes")
         return [{"numero": r[0], "nome": r[1]} for r in cursor.fetchall()]
     except: return []
@@ -110,23 +47,44 @@ async def get_todas_linhas():
 
 @app.get("/onibus", response_model=List[OnibusResponse])
 async def get_realtime_buses(linhas: str = Query(...)):
+    """
+    Busca os dados na prefeitura apenas quando o app pede.
+    Isso evita manter um cache gigante na memória.
+    """
     linhas_alvo = set(linhas.split(","))
     resultado = []
-    agora = time.time()
     
-    # Itera sobre uma cópia das chaves para evitar erro de mutação
-    for ordem in list(global_buses.keys()):
-        data = global_buses.get(ordem)
-        if data and data[0] in linhas_alvo:
-            if agora - data[4] < TEMPO_EXPIRACAO:
-                resultado.append({
-                    "ordem": ordem,
-                    "linha": data[0],
-                    "latitude": data[1],
-                    "longitude": data[2],
-                    "velocidade": data[3],
-                    "status": "Em movimento" if data[3] > 1 else "Parado"
-                })
+    try:
+        async with httpx.AsyncClient() as client:
+            agora_ms = int(time.time() * 1000)
+            # Janela de 40s para garantir que pegamos dados
+            params = { "dataInicial": agora_ms - 40000, "dataFinal": agora_ms }
+            
+            # Fazemos a requisição e processamos IMEDIATAMENTE
+            response = await client.get(URL_FONTE_GPS, params=params, timeout=10.0)
+            
+            if response.status_code == 200:
+                dados = response.json()
+                veiculos = dados if isinstance(dados, list) else dados.get('veiculos', [])
+                
+                for bus in veiculos:
+                    linha = str(bus.get('linha', '')).replace('.0', '')
+                    if linha in linhas_alvo:
+                        resultado.append({
+                            "ordem": bus.get('ordem', 'S/N'),
+                            "linha": linha,
+                            "latitude": float(bus['latitude'].replace(',', '.')),
+                            "longitude": float(bus['longitude'].replace(',', '.')),
+                            "velocidade": float(bus.get('velocidade', 0)),
+                            "status": "Em movimento" if float(bus.get('velocidade', 0)) > 1 else "Parado"
+                        })
+                
+                # Limpeza explícita para ajudar o Garbage Collector
+                del veiculos
+                del dados
+    except Exception as e:
+        print(f"Erro na consulta: {e}")
+        
     return resultado
 
 @app.get("/linhas/{linha_numero}/shape")
