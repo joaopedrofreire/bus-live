@@ -1,0 +1,670 @@
+#### API ####
+
+import asyncio
+import time
+import sqlite3
+import httpx
+from fastapi import FastAPI, Query, HTTPException
+from typing import List, Dict, Optional
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+
+# --- CONFIGURAÇÕES ---
+URL_FONTE_GPS = "https://dados.mobilidade.rio/gps/sppo"
+DB_NAME = "gtfs.db"
+INTERVALO_BUSCA = 10  # segundos
+TEMPO_EXPIRACAO = 300 # 5 minutos
+
+# Cache em memória para os ônibus (Real-time)
+global_buses: Dict[str, dict] = {}
+
+# --- MODELOS PYDANTIC (Para a API) ---
+class PontoCoordenada(BaseModel):
+    latitude: float
+    longitude: float
+
+class OnibusResponse(BaseModel):
+    ordem: str
+    linha: str
+    latitude: float
+    longitude: float
+    velocidade: float
+    status: str
+    direcao: Optional[float] = 0.0 # Direção em graus (se houver)
+
+# --- WORKERS (Background Tasks) ---
+
+async def fetch_rio_data():
+    """Busca dados da API da prefeitura e atualiza o cache."""
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                agora_ms = int(time.time() * 1000)
+                # Janela de 30s para garantir que pegamos dados
+                params = { "dataInicial": agora_ms - 30000, "dataFinal": agora_ms }
+                
+                response = await client.get(URL_FONTE_GPS, params=params, timeout=10.0)
+                
+                if response.status_code == 200:
+                    dados = response.json()
+                    lista = dados if isinstance(dados, list) else dados.get('veiculos', [])
+                    
+                    for bus in lista:
+                        try:
+                            ordem = bus['ordem']
+                            # Atualiza cache
+                            global_buses[ordem] = {
+                                "ordem": ordem,
+                                "linha": str(bus.get('linha', '')).replace('.0', ''),
+                                "latitude": float(bus['latitude'].replace(',', '.')),
+                                "longitude": float(bus['longitude'].replace(',', '.')),
+                                "velocidade": float(bus.get('velocidade', 0)),
+                                "last_seen": time.time()
+                            }
+                        except (ValueError, KeyError):
+                            continue # Ignora dados inválidos
+                    
+                    print(f"📡 GPS Atualizado: {len(lista)} veículos recebidos.")
+            except Exception as e:
+                print(f"❌ Erro ao buscar GPS: {e}")
+            
+            await asyncio.sleep(INTERVALO_BUSCA)
+
+async def clean_inactive_buses():
+    """Remove ônibus que não atualizam há muito tempo."""
+    while True:
+        await asyncio.sleep(60)
+        agora = time.time()
+        chaves_para_remover = [
+            k for k, v in global_buses.items() 
+            if agora - v['last_seen'] > TEMPO_EXPIRACAO
+        ]
+        for k in chaves_para_remover:
+            del global_buses[k]
+        if chaves_para_remover:
+            print(f"🧹 Limpeza: {len(chaves_para_remover)} ônibus inativos removidos.")
+
+# --- LIFESPAN (Inicialização) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicia workers
+    task1 = asyncio.create_task(fetch_rio_data())
+    task2 = asyncio.create_task(clean_inactive_buses())
+    yield
+    # Cancela workers ao desligar (opcional)
+    task1.cancel()
+    task2.cancel()
+
+app = FastAPI(lifespan=lifespan)
+
+# --- HELPER DE BANCO DE DADOS ---
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# --- ENDPOINTS DA API ---
+
+@app.get("/onibus", response_model=List[OnibusResponse])
+async def get_realtime_buses(linhas: str = Query(..., description="Linhas separadas por vírgula")):
+    """Retorna a posição atual dos ônibus das linhas solicitadas."""
+    linhas_alvo = linhas.split(",")
+    resultado = []
+
+    for bus in global_buses.values():
+        if bus['linha'] in linhas_alvo:
+            resultado.append({
+                "ordem": bus['ordem'],
+                "linha": bus['linha'],
+                "latitude": bus['latitude'],
+                "longitude": bus['longitude'],
+                "velocidade": bus['velocidade'],
+                "status": "Em movimento" if bus['velocidade'] > 1 else "Parado"
+            })
+    return resultado
+
+@app.get("/linhas/{linha_numero}/shape", response_model=List[List[PontoCoordenada]])
+async def get_shape_linha(linha_numero: str):
+    """Retorna os shapes (desenho do trajeto) do banco de dados SQLite."""
+    conn = get_db_connection()
+    try:
+        # 1. Achar ID da rota
+        rota = conn.execute("SELECT route_id FROM routes WHERE route_short_name = ?", (linha_numero,)).fetchone()
+        if not rota:
+            return [] # Retorna lista vazia se não achar
+        
+        route_id = rota['route_id']
+
+        # 2. Buscar pontos ordenados
+        rows = conn.execute("""
+            SELECT shape_id, shape_pt_lat, shape_pt_lon 
+            FROM route_shapes 
+            WHERE route_id = ? 
+            ORDER BY shape_id, shape_pt_sequence
+        """, (route_id,)).fetchall()
+        
+        # 3. Agrupar por Shape ID (Ida e Volta são shapes diferentes)
+        shapes_dict = {}
+        for row in rows:
+            sid = row['shape_id']
+            if sid not in shapes_dict:
+                shapes_dict[sid] = []
+            
+            shapes_dict[sid].append({
+                "latitude": row['shape_pt_lat'],
+                "longitude": row['shape_pt_lon']
+            })
+            
+        return list(shapes_dict.values())
+        
+    finally:
+        conn.close()
+
+# Executar com: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+#### Swift ####
+
+//
+//  ContentView.swift
+//  MeuOnibus
+//
+//  Created by João Pedro Freire on 05/01/26.
+//
+
+import SwiftUI
+import Combine
+import Foundation
+import MapKit
+
+import SwiftUI
+import MapKit
+
+struct Parada: Identifiable {
+    let id = UUID()
+    let nome: String
+    let horarioPrevisto: String
+}
+
+struct Onibus: Identifiable, Equatable {
+    let id = UUID()
+    var coordenada: CLLocationCoordinate2D
+    let prefixo: String
+    let corDaLinha: Color
+    let proximasParadas: [Parada] // <-- Adicionado aqui
+    
+    static func == (lhs: Onibus, rhs: Onibus) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
+struct Linha: Identifiable, Equatable, Hashable {
+    let id: UUID = UUID() // UUID garante a unicidade para o Identifiable
+    let numero: String
+    let nome: String
+    let cor: Color
+    let rota: [CLLocationCoordinate2D]
+
+    // Implementação do Equatable para comparar IDs
+    static func == (lhs: Linha, rhs: Linha) -> Bool {
+        return lhs.id == rhs.id
+    }
+
+    // Implementação do Hashable (necessário se usar em List ou Picker)
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
+extension MKCoordinateRegion {
+    static func region(for coordinates: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+        var minLat = 90.0
+        var maxLat = -90.0
+        var minLon = 180.0
+        var maxLon = -180.0
+
+        for coordinate in coordinates {
+            minLat = min(minLat, coordinate.latitude)
+            maxLat = max(maxLat, coordinate.latitude)
+            minLon = min(minLon, coordinate.longitude)
+            maxLon = max(maxLon, coordinate.longitude)
+        }
+
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2, longitude: (minLon + maxLon) / 2)
+        let span = MKCoordinateSpan(latitudeDelta: (maxLat - minLat) * 1.3, longitudeDelta: (maxLon - minLon) * 1.3)
+        return MKCoordinateRegion(center: center, span: span)
+    }
+}
+
+class BusViewModel: ObservableObject {
+    @Published var onibusSelecionado: Onibus? = nil
+    @Published var linhas: [Linha] = [
+        Linha(numero: "416", nome: "Saens Peña X Horto (Expresso)", cor: .blue, rota: [
+            CLLocationCoordinate2D(latitude: -23.5505, longitude: -46.6333),
+            CLLocationCoordinate2D(latitude: -23.5550, longitude: -46.6390),
+            CLLocationCoordinate2D(latitude: -23.5610, longitude: -46.6450)
+        ]),
+        Linha(numero: "409", nome: "Saens Peña X Horto", cor: .blue, rota: [
+            CLLocationCoordinate2D(latitude: -23.5505, longitude: -46.6333),
+            CLLocationCoordinate2D(latitude: -23.5420, longitude: -46.6280),
+            CLLocationCoordinate2D(latitude: -23.5350, longitude: -46.6210)
+        ])
+    ]
+    
+    // Agora usamos um Set para múltiplas linhas
+    @Published var linhasSelecionadas: Set<Linha> = []
+        // Dicionário para guardar a cor atribuída a cada linha no mapa
+        @Published var coresDasLinhas: [UUID: Color] = [:]
+        @Published var onibusAtivos: [Onibus] = []
+    private var timer: Timer?
+    
+    private let paletaCores: [Color] = [.blue, .red, .green, .orange, .purple, .pink, .cyan]
+
+    func toggleLinha(_ linha: Linha) {
+            if linhasSelecionadas.contains(linha) {
+                removerLinha(linha)
+            } else {
+                // 1. Descobrir quais cores já estão a ser usadas pelas outras linhas
+                let coresEmUso = Set(coresDasLinhas.values)
+                
+                // 2. Filtrar a paleta para encontrar cores que NÃO estão em uso
+                let coresDisponiveis = paletaCores.filter { !coresEmUso.contains($0) }
+                
+                // 3. Escolher a primeira cor disponível (ou azul se esgotarem as cores)
+                let corEscolhida = coresDisponiveis.first ?? .gray
+                
+                linhasSelecionadas.insert(linha)
+                coresDasLinhas[linha.id] = corEscolhida
+            }
+            atualizarOnibus()
+        }
+
+    func removerLinha(_ linha: Linha) {
+            linhasSelecionadas.remove(linha)
+            coresDasLinhas.removeValue(forKey: linha.id)
+            atualizarOnibus()
+        }
+
+    func atualizarOnibus() {
+        self.onibusAtivos = linhasSelecionadas.flatMap { linha in
+            let corDaRota = coresDasLinhas[linha.id] ?? .blue
+            
+            return [
+                Onibus(
+                    coordenada: linha.rota.randomElement()!,
+                    prefixo: linha.numero,
+                    corDaLinha: corDaRota,
+                    // Adicione este parâmetro com dados de exemplo:
+                    proximasParadas: [
+                        Parada(nome: "Terminal Central", horarioPrevisto: "14:10"),
+                        Parada(nome: "Av. Principal, 450", horarioPrevisto: "14:25"),
+                        Parada(nome: "Praça da Matriz", horarioPrevisto: "14:40"),
+                        Parada(nome: "Hospital Municipal", horarioPrevisto: "14:55")
+                    ]
+                )
+            ]
+        }
+    }
+
+    func iniciarSimulacao() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            withAnimation(.linear(duration: 1.0)) {
+                for i in 0..<self.onibusAtivos.count {
+                    self.onibusAtivos[i].coordenada.latitude += Double.random(in: -0.0002...0.0002)
+                    self.onibusAtivos[i].coordenada.longitude += Double.random(in: -0.0002...0.0002)
+                }
+            }
+        }
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var viewModel = BusViewModel()
+    @State private var mostrarPesquisa = false
+    
+    // Altera a posição inicial para focar no usuário
+    @State private var posicaoCamera: MapCameraPosition = .userLocation(fallback: .automatic)
+    func ajustarCameraParaTodasAsRotas() {
+            let todasCoordenadas = viewModel.linhasSelecionadas.flatMap { $0.rota }
+            
+            // O guard aqui funciona perfeitamente!
+            guard !todasCoordenadas.isEmpty else { return }
+
+            let novaRegiao = MKCoordinateRegion.region(for: todasCoordenadas)
+            
+            withAnimation(.easeInOut(duration: 1.0)) {
+                posicaoCamera = .region(novaRegiao)
+            }
+        }
+    var body: some View {
+        ZStack {
+            Map(position: $posicaoCamera) {
+                UserAnnotation()
+                
+                // CORREÇÃO AQUI: Em vez de "if let selecionada", usamos ForEach
+                ForEach(Array(viewModel.linhasSelecionadas)) { linha in
+                        MapPolyline(coordinates: linha.rota)
+                            .stroke(viewModel.coresDasLinhas[linha.id] ?? .blue, lineWidth: 6)
+                    }
+                
+                // Desenha os ônibus (eles já estão filtrados no ViewModel)
+                ForEach(viewModel.onibusAtivos) { bus in
+                    Annotation(bus.prefixo, coordinate: bus.coordenada) {
+                        Button {
+                            // Seleciona o ônibus e centraliza
+                            viewModel.onibusSelecionado = bus
+                            withAnimation(.easeInOut) {
+                                posicaoCamera = .region(MKCoordinateRegion(
+                                    center: bus.coordenada,
+                                    span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                                ))
+                            }
+                        } label: {
+                            ZStack {
+                                Circle().frame(width: 40, height: 40).glassEffect()
+                                Image(systemName: "bus.fill")
+                                    .foregroundColor(bus.corDaLinha)
+                            }
+                            .shadow(radius: 3)
+                        }.buttonStyle(.plain).scaleEffect(viewModel.onibusSelecionado == bus ? 1.2 : 1.0)
+                            .contentShape(Circle()) // Garante que toda a área do círculo seja clicável
+                            .onTapGesture {
+                                viewModel.onibusSelecionado = bus
+                                // Centraliza a câmera ao clicar
+                                withAnimation {
+                                    posicaoCamera = .region(MKCoordinateRegion(
+                                        center: bus.coordenada,
+                                        span: MKCoordinateSpan(latitudeDelta: 0.005, longitudeDelta: 0.005)
+                                    ))
+                                }
+                            }
+                    }
+                }
+            }
+            .mapControls {
+                MapUserLocationButton()
+                MapCompass()
+            }.mapStyle(.standard(emphasis: .muted))
+                .ignoresSafeArea()
+            
+            // MARK: - Header Sobreposto
+            VStack {
+                ZStack(alignment: .top) {
+                    // 1. Camada de Gradiente Preto (para legibilidade)
+                    LinearGradient(
+                        gradient: Gradient(colors: [.black, .black.opacity(0.7), .clear]),
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 200) // Um pouco mais alto que o Safe Area
+                    .allowsHitTesting(false)
+                    .ignoresSafeArea() // Permite tocar no mapa através do gradiente
+
+                    // 3. Conteúdo (Logo e Botão)
+                    HStack {
+                        // Logo Alinhada à Esquerda
+                        HStack(spacing: 10) {
+                            Image(systemName: "bus.fill")
+                                .font(.title2)
+                                .foregroundColor(.white)
+                            
+                            Text("BusLive")
+                                .font(.title3)
+                                .fontWeight(.black)
+                                .foregroundColor(.white)
+                        }
+                        
+                        Spacer()
+
+                        // Botão de Configuração à Direita
+                        Button {
+                            print("Abrir Configurações")
+                        } label: {
+                            Image(systemName: "gearshape.fill")
+                                .font(.title3)
+                                .foregroundColor(.white)
+                                .padding(15)
+                                .clipShape(Circle())
+                                .glassEffect()
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 10) // Ajuste fino conforme o entalhe do iPhone
+                }
+                Spacer() // Empurra o header para o topo
+            }.animation(.spring(), value: viewModel.onibusSelecionado)
+            
+            if viewModel.onibusSelecionado == nil {
+                
+                // 3. LISTA LATERAL ESQUERDA (CRESCE DE BAIXO PARA CIMA)
+                HStack(alignment: .bottom) { // Alinha o conteúdo do HStack na base
+                    
+                    Spacer() // Empurra tudo para a esquerda
+                    VStack(alignment: .leading) {
+                        Spacer() // Garante que o bloco de baixo seja empurrado para o rodapé
+                        
+                        if !viewModel.linhasSelecionadas.isEmpty {
+                            // Invertemos o array (.reversed()) para que a mais recente fique embaixo
+                            let linhasOrdenadas = Array(viewModel.linhasSelecionadas).reversed()
+                            
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(linhasOrdenadas) { linha in
+                                    Menu {
+                                        Button(role: .destructive) {
+                                            viewModel.removerLinha(linha)
+                                        } label: {
+                                            Label("Remover", systemImage: "trash")
+                                        }
+                                    } label: {
+                                        HStack(spacing: 8) {
+                                            Circle()
+                                                .fill(viewModel.coresDasLinhas[linha.id] ?? .blue)
+                                                .frame(width: 15, height: 15)
+                                            
+                                            Text(linha.numero)
+                                                .font(.system(size: 16, weight: .regular, design: .rounded))
+                                                .foregroundColor(.white)
+                                        }
+                                        .padding(.vertical, 12)
+                                        .padding(.horizontal, 16)
+                                        .glassEffect()
+                                        .clipShape(Capsule())
+                                        .shadow(radius: 2)
+                                    }.transition(.asymmetric(
+                                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                                        removal: .opacity
+                                    ))
+                                }
+                            }
+                            .padding(.trailing, 30)
+                            .padding(.bottom, 80) // Espaço para não sobrepor o botão de busca
+                        }
+                    }
+                }
+                .animation(.spring(response: 0.4, dampingFraction: 0.7), value: viewModel.linhasSelecionadas).transition(.opacity.combined(with: .move(edge: .trailing))) // Animação de saída
+                
+                // BOTÃO DE PESQUISA (Inferior Direito)
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Button {
+                            mostrarPesquisa.toggle()
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.title)
+                                .foregroundColor(.white)
+                                .shadow(radius: 5)
+                                .padding()
+                                .glassEffect()
+                        }
+                        .padding(.bottom, 0)
+                        .padding(.horizontal, 30)
+                        .ignoresSafeArea()
+                    }
+                }.transition(.opacity.combined(with: .move(edge: .trailing))) // Animação de saída
+            }
+        }
+        .sheet(isPresented: $mostrarPesquisa) {
+            SearchView(viewModel: viewModel)
+        }
+        .sheet(item: $viewModel.onibusSelecionado) { bus in
+            BusInfoSheet(bus: bus)
+                .presentationDetents([.medium, .large]) // Agora permite abrir quase tudo
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium)) // Permite mexer no mapa enquanto vê a lista
+        }// 3. GATILHO PARA AJUSTAR O MAPA QUANDO SELECIONAR NOVA LINHA
+        .onChange(of: viewModel.linhasSelecionadas) {
+            ajustarCameraParaTodasAsRotas()
+        }
+    }
+}
+
+// TELA DE PESQUISA
+struct SearchView: View {
+    @ObservedObject var viewModel: BusViewModel
+    @State private var searchText = ""
+    @Environment(\.dismiss) var dismiss
+
+    // Filtra as linhas com base no texto da busca
+    var linhasFiltradas: [Linha] {
+        if searchText.isEmpty {
+            return viewModel.linhas
+        } else {
+            return viewModel.linhas.filter {
+                $0.nome.localizedCaseInsensitiveContains(searchText) ||
+                $0.numero.contains(searchText)
+            }
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List(linhasFiltradas) { linha in
+                Button {
+                    viewModel.toggleLinha(linha)
+                } label: {
+                    // Dentro da List na SearchView
+                    HStack {
+                        Image(systemName: viewModel.linhasSelecionadas.contains(linha) ? "checkmark.circle.fill" : "circle")
+                            .foregroundColor(viewModel.linhasSelecionadas.contains(linha) ? .blue : .gray)
+
+                        Text(linha.numero)
+                            .font(.subheadline.bold())
+                            .padding(8)
+                            .background(Color.blue.opacity(0.1)) // Cor azul fixa aqui
+                            .foregroundColor(.blue)
+                            .cornerRadius(8)
+                        
+                        Text(linha.nome)
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                }
+            }
+            .navigationTitle("Linhas")
+            .searchable(text: $searchText, prompt: "Número ou nome da linha")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Pronto") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+struct BusInfoSheet: View {
+    let bus: Onibus
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(bus.prefixo)")
+                        .font(.title2.bold())
+                    
+                    Text("Linha em operação")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                
+                // Círculo com a cor da linha para conferência rápida
+                Circle()
+                    .fill(bus.corDaLinha)
+                    .frame(width: 25, height: 25)
+            }
+            .padding(.top, 30)
+            
+            Divider()
+            
+            HStack(spacing: 40) {
+                VStack {
+                    Image(systemName: "speedometer").font(.title3)
+                    Text("42 km/h").font(.caption)
+                }
+                VStack {
+                    Image(systemName: "clock.fill").font(.title3)
+                    Text("Há 2 min").font(.caption)
+                }
+            }
+            .foregroundColor(.secondary)
+            
+            // Lista de Paradas (Rolável)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text("PRÓXIMAS PARADAS")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 25)
+                                    .padding(.bottom, 10)
+
+                                ForEach(Array(bus.proximasParadas.enumerated()), id: \.element.id) { index, parada in
+                                    HStack(spacing: 15) {
+                                        // Indicador Visual (Linha do tempo)
+                                        VStack(spacing: 0) {
+                                            Circle()
+                                                .fill(index == 0 ? bus.corDaLinha : Color.gray.opacity(0.3))
+                                                .frame(width: 10, height: 10)
+                                            
+                                            if index != bus.proximasParadas.count - 1 {
+                                                Rectangle()
+                                                    .fill(Color.gray.opacity(0.2))
+                                                    .frame(width: 2, height: 40)
+                                            }
+                                        }
+                                        .frame(width: 20)
+
+                                        VStack(alignment: .leading) {
+                                            Text(parada.nome)
+                                                .font(.system(.body, design: .rounded))
+                                                .fontWeight(.medium)
+                                        }
+                                        
+                                        Spacer()
+                                        
+                                        Text(parada.horarioPrevisto)
+                                            .font(.system(.subheadline, design: .monospaced))
+                                            .foregroundColor(index == 0 ? bus.corDaLinha : .secondary)
+                                            .fontWeight(index == 0 ? .bold : .regular)
+                                    }
+                                    .padding(.horizontal, 25)
+                                    .frame(height: 50)
+                                }
+                            }
+                            .padding(.vertical, 10)
+                        }
+            Spacer()
+        }
+        .padding(.horizontal, 25)
+    }
+}
+
+
+#Preview {
+    ContentView()
+}
+

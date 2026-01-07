@@ -1,5 +1,4 @@
 fastapi
-uvicorn
-redis
-apscheduler
-requests
+uvicorn[standard]
+httpx
+pydantic
